@@ -1,0 +1,321 @@
+import os
+import sys
+import argparse
+import numpy as np
+from PTL import Image
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Adam
+from torch.utils.data import Dataset
+import torchvision.transforms as transforms
+from skimage.segmentation import slic
+from lime import lime_image
+from pdb import set_trace
+
+#  Argument parsing
+args = {
+      'ckptpath': './checkpoint.pth',
+      'dataset_dir': './food-11/'
+}
+args = argparse.Namespace(**args)
+#  Model definition and checkpoint loading
+#  这是助教的示范 model
+class Classifier(nn.Module):
+  def __init__(self):
+    super(Classifier, self).__init__()
+
+    def building_block(indim, outdim):
+      return [
+        nn.Conv2d(indim, outdim, 3, 1, 1),
+        nn.BatchNorm2d(outdim),
+        nn.ReLU(),
+      ]
+    def stack_blocks(indim, outdim, block_num):
+      layers = building_block(indim, outdim)
+      for i in range(block_num - 1):
+        layers += building_block(outdim, outdim)
+      layers.append(nn.MaxPool2d(2, 2, 0))
+      return layers
+
+    cnn_list = []
+    cnn_list += stack_blocks(3, 128, 3)
+    cnn_list += stack_blocks(128, 128, 3)
+    cnn_list += stack_blocks(128, 256, 3)
+    cnn_list += stack_blocks(256, 512, 1)
+    cnn_list += stack_blocks(512, 512, 1)
+    self.cnn = nn.Sequential( * cnn_list)
+
+    dnn_list = [
+      nn.Linear(512 * 4 * 4, 1024),
+      nn.ReLU(),
+      nn.Dropout(p = 0.3),
+      nn.Linear(1024, 11),
+    ]
+    self.fc = nn.Sequential( * dnn_list)
+
+  def forward(self, x):
+    out = self.cnn(x)
+    out = out.reshape(out.size()[0], -1)
+    return self.fc(out)
+model = Classifier().cuda()
+checkpoint = torch.load(args.ckptpath)
+model.load_state_dict(checkpoint['model_state_dict'])
+
+#  Dataset definition and creation
+# training 时定义的 dataset
+# 因为 training 的时候有使用底下那些 transforms，所以 testing 时也要让 test data 使用同样的 transform
+class FoodDataset(Dataset):
+    def __init__(self, paths, labels, mode):
+        # mode: 'train' or 'eval'
+
+        self.paths = paths
+        self.labels = labels
+        trainTransform = transforms.Compose([
+            transforms.Resize(size=(128, 128)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(15),
+            transforms.ToTensor(),
+        ])
+        evalTransform = transforms.Compose([
+            transforms.Resize(size=(128, 128)),
+            transforms.ToTensor(),
+        ])
+        self.transform = trainTransform if mode == 'train' else evalTransform
+    #  这个FoodDataset 继承了 pytorch 的 Dataset class
+    #  而 __len__ 和 __getitem__ 是定义一个 pytorch dataset 时一定要 implement 的两个 methods
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, index):
+        X = Image.open(self.paths[index])
+        X = self.transform(X)
+        Y = self.labels[index]
+        return X, Y
+    #  这个 method 并不是 pytorch dataset 必要，只是方便未来我们想要指定「取那几张图片」出来当做一个 batch 来 visualize
+    def getbatch(self, indices):
+        images = []
+        labels = []
+        for index in indices:
+            image, label = self.__getitem__(index)
+            images.append(image)
+            labels.append(label)
+        return torch.stack(images), torch.tensor(labels)
+    #  给予 data 的路径，回传每一张图片的「路径」和「class」
+    def get_paths_labels(path):
+        imgnames = os.listdir(path)
+        imgnames.sort()
+        imgpaths = []
+        labels = []
+        for name in imgnames:
+            imgpaths.append(os.path.join(path, name))
+            labels.append(int(name.split('_')[0]))
+        return imgpaths, labels
+
+    train_paths, train_labels = get_paths_labels(os.path.join(args.dataset_dir, 'training'))
+    #  这边在 initialize dataset 时只丟「路径」和「class」，之后要从 dataset 取资料时
+    #  dataset 的 __getitem__ method 才会动态的去 load 每个路径对应的图片
+    train_set = FoodDataset(train_paths, train_labels, mode='eval')
+'''
+Start Homework 4
+Saliency map
+我们把一张图片丟进 model，forward 后与 label 计算出 loss。 因此与 loss 相关的有:
+image
+model parameter
+label
+通常的情況下，我們想要改变 model parameter 来 fit image 和 label。因此 loss 在计算 backward 时我們只在乎 loss 对 model parameter 的偏微分值。
+但数学上 image 本身也是 continuous tensor，我們可以计算 loss 对 image 的偏微分值。這个偏微分值代表「在 model parameter 和 label 都固定下，
+稍微改变 image 的某个 pixel value 会对 loss 产生什么变化」。人们习惯把这个变化的剧烈程度解读成该 pixel 的重要性 (每个 pixel 都有自己的偏微分值)。
+因此把同一张图中，loss 对每个 pixel 的偏微分值画出來，就可以看出该图中哪些位置是 model 在判断时的重要依据。
+
+作业上非常简单，过去我们都是 forward 后算出 loss，然后进行 backward。而这个 backward，pytorch 预设是计算 loss 对 model parameter 的偏微分值，
+因此我们只需要用一行 code 额外告知 pytorch，image 也是要算偏微分的对象之一。
+'''
+def normalize(image):
+    return (image - image.min()) / (image.max() - image.min())
+
+def compute_saliency_maps(x, y, model):
+    model.eval()
+    x = x.cuda()
+    #  最关键的一行 code
+    #  因为我们要计算 loss 对 input image 的微分，原本 input x 只是一个 tensor，预设不需要 gradient
+    #  这边我们明确的告知 pytorch 这个 input x 需要gradient，这样我们执行 backward 后 x.grad 才会有微分的值
+    x.requires_grad_()
+
+    y_pred = model(x)
+    loss_func = torch.nn.CrossEntropyLoss()
+    loss = loss_func(y_pred, y.cuda())
+    loss.backward()
+
+    saliencies = x.grad.abs().detach().cpu()
+    # saliencies: (batches, channels, height, weight)
+    # 因为接下来我们要对每张图片画 saliency map，每张图片的 gradient scale 很可能有巨大落差
+    # 可能第一张图片的 gradient 在 100 ~ 1000，但第二张图片的 gradient 在 0.001 ~ 0.0001
+    # 如果我們用同样的色階去画每一张 saliency 的话，第一张可能就全部都很亮，第二张就全部都很暗，
+    # 如此就看不到有意义的結果，我們想看的是「单一张 saliency 內部的大小关系」，
+    # 所以这边我们要对每张 saliency 各自做 normalize。手法有很多种，这边只采用最简单的
+    saliencies = torch.stack([normalize(item) for item in saliencies])
+    return saliencies
+# 指定想要一起 visualize 的图片 indices
+img_indices = [83, 4218, 4707, 8598]
+images, labels = train_set.getbatch(img_indices)
+saliencies = compute_saliency_maps(images, labels, model)
+
+# 使用 matplotlib 画出来
+fig, axs = plt.subplots(2, len(img_indices), figsize=(15, 8))
+for row, target in enumerate([images, saliencies]):
+  for column, img in enumerate(target):
+    axs[row][column].imshow(img.permute(1, 2, 0).numpy())
+    # 小知识：permute 是什么，为什么这边要用?
+    # 在 pytorch 的世界，image tensor 各 dimension 的意义通常为 (channels, height, width)
+    # 但在 matplolib 的世界，想要把一个 tensor 画出來，形状必須为 (height, width, channels)
+    # 因此 permute 是一个 pytorch 很方便的工具来做 dimension 间的转换
+    # 这边 img.permute(1, 2, 0)，代表转换后的 tensor，其
+    # - 第 0 个 dimension 为原本 img 的第 1 个 dimension，也就是 height
+    # - 第 1 个 dimension 为原本 img 的第 2 个 dimension，也就是 width
+    # - 第 2 个 dimension 为原本 img 的第 0 个 dimension，也就是 channels
+plt.show()
+plt.close()
+'''
+Filter explaination
+这里我们想要知道某一个 filter 到底认出了什么。我们会做以下兩件事情：
+Filter activation: 挑张图片出來，看看图片中哪些位置会 activate 该 filter
+Filter visualization: 怎样的 image 可以最大程度的 activate 该 filter
+作业上比较困难的地方是，通常我們是直接把 image 丟进 model，一路 forward 到底。如：
+loss = model(image)
+loss.backward()
+我们要怎么得到中间某层 CNN 的 output? 当然我們可以直接修改 model definition，
+让 forward 不只 return loss，也 return activation map。但这样的写法麻烦了，
+更改了 forward 的 output 可能会让其他部分的 code 要跟着改动。
+因此 pytorch 提供了方便的 solution: hook，以下我们会再介紹。
+'''
+def normalize(image):
+  return (image - image.min()) / (image.max() - image.min())
+
+layer_activations = None
+def filter_explaination(x, model, cnnid, filterid, iteration=100, lr=1):
+    #  x: 要用来关察哪些位置可以 activate 被指定 filter 的图片们
+    #  cnnid, filterid: 想要指定第几层 cnn 中第几个 filter
+    model.eval()
+
+    def hook(model, input, output):
+        global layer_activations
+        layer_activations = output
+
+    hook_handle = model.cnn[cnnid].register_forward_hook(hook)
+    # 这一行是在告訴 pytorch，当 forward 「过了」第 cnnid 层 cnn 后，要先调用 hook 这个我們定义的 function 后才可以继续 forward 下一层 cnn
+    # 因此上面的 hook function 中，我們就会把改层的 output，也就是 activation map 记录下來，这样 forward 完整个 model 后我們就不只有 loss
+    # 也有某层 cnn 的 activation map
+    # 注意：到这行为止，都还沒有发生任何 forward。我們只是先告訴 pytorch 等下真的要 forward 时该多做什么事
+    # 注意：hook_handle 可以先跳过不用懂，等下看到后面就有说明了
+
+    # Filter activation: 我們先观察 x 经过被指定 filter 的 activation map
+    model(x.cuda())
+    # 这行才是正式执行 forward，因为我们只在意 activation map，所以这边不需要把 loss 存起來
+    filter_activations = layer_activations[:, filterid, :, :].detach().cpu()
+
+    # 根据 function argument 指定的 filterid 把特定 filter 的 activation map 取出來
+    # 因为目前这个 activation map 我們只是要把他画出來，所以可以直接 detach from graph 并存成 cpu tensor
+
+    # Filter visualization: 接着我們要找出可以最大程度 activate 该 filter 的图片
+    x = x.cuda()
+    # 从一张 random noise 的图片开始找 (也可以从一张 dataset image 开始找)
+    x.requires_grad_()
+    # 我們要对 input image 算偏微分
+    optimizer = Adam([x], lr=lr)
+    # 利用偏微分和 optimizer，逐步修改 input image 来让 filter activation 越來越大
+    for iter in range(iteration):
+        optimizer.zero_grad()
+        model(x)
+
+        objective = -layer_activations[:, filterid, :, :].sum()
+        # 与上一个作业不同的是，我们并不想知道 image 的微量变化会怎样影响 final loss
+        # 我們想知道的是，image 的微量变化会怎样影响 activation 的程度
+        # 因此 objective 是 filter activation 的总和，然后加负号代表我們想要做 maximization
+
+        objective.backward()
+        # 计算 filter activation 对 input image 的偏微分
+        optimizer.step()
+        # 修改 input image 來最大化 filter activation
+    filter_visualization = x.detach().cpu().squeeze()[0]
+    # 完成图片修改，只剩下要画出來，因此可以直接 detach 并转成 cpu tensor
+
+    hook_handle.remove()
+    # 很重要：一旦对 model register hook，该 hook 就一直存在。如果之后继续 register 更多 hook
+    # 那 model 一次 forward 要做的事情就越來越多，甚至其行为模式会超出你預期 (因为你忘记哪边有用不到的 hook 了)
+    # 因此事情做完了之后，就把这个 hook 拿掉，下次想要再做事时再 register 就好了。
+
+    return filter_activations, filter_visualization
+
+
+images, labels = train_set.getbatch(img_indices)
+filter_activations, filter_visualization = filter_explaination(images, model, cnnid=15, filterid=0, iteration=100, lr=0.1)
+
+# 画出 filter visualization
+plt.imshow(normalize(filter_visualization.permute(1, 2, 0)))
+plt.show()
+plt.close()
+# 根据图片中的线条，可以猜测第 15 层 cnn 其第 0 个 filter 可能在認一些線條、甚至是 object boundary
+# 因此給 filter 看一堆对比強烈的线条，他会觉得有好多 boundary 可以 activate
+
+# 画出 filter activations
+fig, axs = plt.subplots(2, len(img_indices), figsize=(15, 8))
+for i, img in enumerate(images):
+  axs[0][i].imshow(img.permute(1, 2, 0))
+for i, img in enumerate(filter_activations):
+  axs[1][i].imshow(normalize(img))
+plt.show()
+plt.close()
+# 从下面四张图可以看到，activate 的区域对应到一些物品的边界，尤其是顏色對比较深的边界
+
+'''
+Lime
+Lime 的部分因为有现成的套件可以使用，因此下方直接 demo 如何使用该套件。
+其实非常的简单，只需要 implement 两个 function 即可。
+'''
+def predict(input):
+#  input: numpy array, (batches, height, width, channels)
+    model.eval()
+    input = torch.FloatTensor(input).permute(0, 3, 1, 2)
+    # 需要先将 input 转成 pytorch tensor，且符合 pytorch 习惯的 dimension 定义
+    # 也就是 (batches, channels, height, width)
+
+    output = model(input.cuda())
+    return output.detach().cpu().numpy()
+
+
+def segmentation(input):
+    # 利用 skimage 提供的 segmentation 将图片分成 100 块
+    return slic(input, n_segments=100, compactness=1, sigma=1)
+
+
+img_indices = [83, 4218, 4707, 8598]
+images, labels = train_set.getbatch(img_indices)
+fig, axs = plt.subplots(1, 4, figsize=(15, 8))
+np.random.seed(16)
+#  让实验 reproducible
+for idx, (image, label) in enumerate(zip(images.permute(0, 2, 3, 1).numpy(), labels)):
+    x = image.astype(np.double)
+    #  lime 这个套件要吃 numpy array
+
+    explainer = lime_image.LimeImageExplainer()
+    explaination = explainer.explain_instance(image=x, classifier_fn=predict, segmentation_fn=segmentation)
+    # 基本上只要提供給 lime explainer 两个关键的 function，事情就结束了
+    # classifier_fn 定义图片如何经过 model 得到 prediction
+    # segmentation_fn 定义如何把图片做 segmentation
+    # doc: https://lime-ml.readthedocs.io/en/latest/lime.html?highlight=explain_instance#lime.lime_image.LimeImageExplainer.explain_instance
+
+    lime_img, mask = explaination.get_image_and_mask(
+        label=label.item(),
+        positive_only=False,
+        hide_rest=False,
+        num_features=11,
+        min_weight=0.05
+    )
+    # 把 explainer 解释的结果转成图片
+    # doc: https://lime-ml.readthedocs.io/en/latest/lime.html?highlight=get_image_and_mask#lime.lime_image.ImageExplanation.get_image_and_mask
+
+    axs[idx].imshow(lime_img)
+plt.show()
+plt.close()
